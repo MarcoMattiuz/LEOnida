@@ -1,0 +1,2 @@
+skyfield==1.55
+matplotlib>=3.9,<4
