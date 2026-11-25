@@ -1,17 +1,33 @@
-from datetime import datetime, timezone
-import math
+"""Dati orbitali OMM, propagazione Skyfield e nodo satellite OpenFlow."""
 
-import numpy as np # type: ignore
+from __future__ import annotations
 
-from mininet.node import OVSSwitch # type: ignore
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from functools import cached_property, lru_cache
 
-R_EARTH = 6378.137          # km
-MU = 398600.4418            # km^3/s^2, costante gravitazionale terrestre
-OMEGA_EARTH = 7.2921159e-5  # rad/s, velocita' di rotazione della Terra
+import numpy as np
+from mininet.node import OVSSwitch  # type: ignore
+from skyfield.api import EarthSatellite, load, wgs84
+from skyfield.framelib import itrs
+from skyfield.timelib import Time, Timescale
+
+
+@lru_cache(maxsize=1)
+def _timescale() -> Timescale:
+    """Condivide le tabelle temporali incluse in Skyfield, senza download."""
+    return load.timescale(builtin=True)
+
 
 @dataclass(frozen=True)
 class Satellite:
+    """Un record GP/OMM; EPOCH resta l'epoca originale degli elementi.
+
+    Skyfield interpreta i campi tramite EarthSatellite.from_omm(). L'istante
+    comune della simulazione sara' passato ad at() e subpoint() dal futuro
+    gestore degli scenari, senza sostituire le epoche dei singoli satelliti.
+    """
+
     OBJECT_NAME: str
     OBJECT_ID: str
     EPOCH: str
@@ -31,75 +47,53 @@ class Satellite:
     REV_AT_EPOCH: int = 0
 
     def to_omm(self) -> dict:
+        """Restituisce solo i campi OMM, senza gli oggetti Skyfield derivati."""
         return asdict(self)
 
+    @cached_property
+    def skyfield_satellite(self) -> EarthSatellite:
+        """Propagatore SGP4 costruito da Skyfield a partire dal record OMM."""
+        return EarthSatellite.from_omm(_timescale(), self.to_omm())
+
     @staticmethod
-    def to_datetime(time):
-        """
-        Converte l'istante in un datetime UTC.
-        Accetta un Time di skyfield (quello usato da graph_path e main) oppure un
-        datetime con timezone.
-        """
-        if hasattr(time, "utc_datetime"):                     # Time di skyfield
+    def to_datetime(time: Time | datetime) -> datetime:
+        """Converte un singolo istante Skyfield o datetime con timezone in UTC."""
+        if isinstance(time, Time):
+            if time.shape:
+                raise ValueError("Specificare un singolo istante, non un array di tempi.")
             return time.utc_datetime()
-        if time.tzinfo is None:
+        if not isinstance(time, datetime):
+            raise TypeError("L'istante deve essere un Time Skyfield o un datetime.")
+        if time.tzinfo is None or time.utcoffset() is None:
             raise ValueError("Il datetime deve avere la timezone (es. timezone.utc).")
         return time.astimezone(timezone.utc)
 
-    def gmst(self, time):
-        """
-        Angolo di rotazione della Terra (Greenwich Mean Sidereal Time) in radianti.
-        time: datetime UTC
-        """
-        jd = time.timestamp() / 86400.0 + 2440587.5
-        d = jd - 2451545.0
-        return math.radians((280.46061837 + 360.98564736629 * d) % 360)
+    def _position_at(self, time: Time | datetime):
+        if isinstance(time, Time):
+            if time.shape:
+                raise ValueError("Specificare un singolo istante, non un array di tempi.")
+        else:
+            time = _timescale().from_datetime(self.to_datetime(time))
+        position = self.skyfield_satellite.at(time)
+        if position.message is not None:
+            raise RuntimeError(
+                f"Errore SGP4 per {self.OBJECT_NAME} "
+                f"(NORAD {self.NORAD_CAT_ID}): {position.message}"
+            )
+        return position
 
-    def at(self, time):
-        """
-        Posizione ECEF (x, y, z) in km all'istante time, calcolata con Keplero.
-        time: Time di skyfield oppure datetime con timezone.
-        Restituisce un array numpy, come skyfield frame_xyz(itrs).km: si puo' usare
-        direttamente per distanze, grafo e ritardi.
-        """
-        time = self.to_datetime(time)
-        deg = math.radians
-        epoch = datetime.fromisoformat(self.EPOCH).replace(tzinfo=timezone.utc)
-        dt = (time - epoch).total_seconds()
+    def at(self, time: Time | datetime) -> np.ndarray:
+        """Posizione ECEF/ITRS (x, y, z) in km, propagata con Skyfield."""
+        return self._position_at(time).frame_xyz(itrs).km
 
-        n = self.MEAN_MOTION * 2 * math.pi / 86400            # rad/s
-        a = (MU / n**2) ** (1 / 3)                            # semiasse maggiore (Keplero III)
-        e = self.ECCENTRICITY
-        i, raan, w = deg(self.INCLINATION), deg(self.RA_OF_ASC_NODE), deg(self.ARG_OF_PERICENTER)
-
-        M = deg(self.MEAN_ANOMALY) + n * dt                   # 1. anomalia media all'istante t
-        E = M
-        for _ in range(10):                                   # 2. equazione di Keplero  M = E - e sin E
-            E = E - (E - e * math.sin(E) - M) / (1 - e * math.cos(E))
-        nu = 2 * math.atan2(math.sqrt(1 + e) * math.sin(E / 2), math.sqrt(1 - e) * math.cos(E / 2))  # anomalia vera
-        r = a * (1 - e * math.cos(E))                         # distanza dal centro della Terra
-
-        x_orb, y_orb = r * math.cos(nu), r * math.sin(nu)     # 3. posizione nel piano dell'orbita
-
-        # 4. rotazioni: argomento del perigeo (w), inclinazione (i), nodo ascendente (raan) -> spazio inerziale
-        cO, sO, ci, si, cw, sw = math.cos(raan), math.sin(raan), math.cos(i), math.sin(i), math.cos(w), math.sin(w)
-        x = (cO * cw - sO * sw * ci) * x_orb + (-cO * sw - sO * cw * ci) * y_orb
-        y = (sO * cw + cO * sw * ci) * x_orb + (-sO * sw + cO * cw * ci) * y_orb
-        z = (sw * si) * x_orb + (cw * si) * y_orb
-
-        th = self.gmst(time)                                          # 5. la Terra ruota: inerziale -> ECEF
-        xe, ye = math.cos(th) * x + math.sin(th) * y, -math.sin(th) * x + math.cos(th) * y
-
-        return np.array([xe, ye, z])
-
-    def subpoint(self, time):
-        """
-        Latitudine, longitudine (gradi) e quota (km) all'istante time (Terra sferica).
-        """
-        xe, ye, z = self.at(time)
-        lat = math.degrees(math.atan2(z, math.hypot(xe, ye)))
-        lon = math.degrees(math.atan2(ye, xe))
-        return lat, lon, math.sqrt(xe**2 + ye**2 + z**2) - R_EARTH
+    def subpoint(self, time: Time | datetime) -> tuple[float, float, float]:
+        """Latitudine/longitudine WGS84 in gradi e quota ellissoidica in km."""
+        point = wgs84.geographic_position_of(self._position_at(time))
+        return (
+            float(point.latitude.degrees),
+            float(point.longitude.degrees),
+            float(point.elevation.km),
+        )
 
 
 class SatelliteSwitch(OVSSwitch):
